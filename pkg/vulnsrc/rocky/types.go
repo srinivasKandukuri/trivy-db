@@ -9,6 +9,7 @@ type RLSA struct {
 	Packages    []Package   `json:"packages,omitempty"`
 	References  []Reference `json:"references,omitempty"`
 	CveIDs      []string    `json:"cveids,omitempty"`
+	Issued      Date        `xml:"issued" json:"issued,omitempty"`
 }
 
 // Reference has reference information
@@ -27,4 +28,8 @@ type Package struct {
 	Release  string `json:"release,omitempty"`
 	Arch     string `json:"arch,omitempty"`
 	Filename string `json:"filename,omitempty"`
+}
+
+type Date struct {
+	Date string `xml:"date,attr" json:"date,omitempty"`
 }

@@ -32,14 +32,36 @@ var (
 	}
 )
 
+type Option func(src *VulnSrc)
+
+func WithCustomPut(put db.CustomPut) Option {
+	return func(src *VulnSrc) {
+		src.put = put
+	}
+}
+
+func WithDB(db db.Operation) Option {
+	return func(src *VulnSrc) {
+		src.dbc = db
+	}
+}
+
 type VulnSrc struct {
+	put db.CustomPut
 	dbc db.Operation
 }
 
-func NewVulnSrc() VulnSrc {
-	return VulnSrc{
+func NewVulnSrc(opts ...Option) VulnSrc {
+	src := VulnSrc{
+		put: defaultPut,
 		dbc: db.Config{},
 	}
+
+	for _, o := range opts {
+		o(&src)
+	}
+
+	return src
 }
 
 func (vs VulnSrc) Name() types.SourceID {
@@ -84,6 +106,20 @@ func (vs VulnSrc) save(ovals []OracleOVAL) error {
 }
 
 func (vs VulnSrc) commit(tx *bolt.Tx, ovals []OracleOVAL) error {
+
+	if err := vs.put(vs.dbc, tx, ovals); err != nil {
+		return xerrors.Errorf("put error: %w", err)
+	}
+	return nil
+}
+
+func defaultPut(dbi interface{}, tx *bolt.Tx, advisory interface{}) error {
+	dbc := dbi.(db.Config)
+	ovals, ok := advisory.([]OracleOVAL)
+	if !ok {
+		return xerrors.New("unknown type")
+	}
+
 	for _, oval := range ovals {
 		elsaID := strings.Split(oval.Title, ":")[0]
 
@@ -106,7 +142,7 @@ func (vs VulnSrc) commit(tx *bolt.Tx, ovals []OracleOVAL) error {
 				continue
 			}
 
-			if err := vs.dbc.PutDataSource(tx, platformName, source); err != nil {
+			if err := dbc.PutDataSource(tx, platformName, source); err != nil {
 				return xerrors.Errorf("failed to put data source: %w", err)
 			}
 
@@ -115,7 +151,7 @@ func (vs VulnSrc) commit(tx *bolt.Tx, ovals []OracleOVAL) error {
 			}
 
 			for _, vulnID := range vulnIDs {
-				if err := vs.dbc.PutAdvisoryDetail(tx, vulnID, affectedPkg.Package.Name, []string{platformName}, advisory); err != nil {
+				if err := dbc.PutAdvisoryDetail(tx, vulnID, affectedPkg.Package.Name, []string{platformName}, advisory); err != nil {
 					return xerrors.Errorf("failed to save Oracle Linux OVAL: %w", err)
 				}
 			}
@@ -134,18 +170,17 @@ func (vs VulnSrc) commit(tx *bolt.Tx, ovals []OracleOVAL) error {
 				Severity:    severityFromThreat(oval.Severity),
 			}
 
-			if err := vs.dbc.PutVulnerabilityDetail(tx, vulnID, source.ID, vuln); err != nil {
+			if err := dbc.PutVulnerabilityDetail(tx, vulnID, source.ID, vuln); err != nil {
 				return xerrors.Errorf("failed to save Oracle Linux OVAL vulnerability: %w", err)
 			}
 
 			// for optimization
-			if err := vs.dbc.PutVulnerabilityID(tx, vulnID); err != nil {
+			if err := dbc.PutVulnerabilityID(tx, vulnID); err != nil {
 				return xerrors.Errorf("failed to save the vulnerability ID: %w", err)
 			}
 		}
 	}
 	return nil
-
 }
 
 func (vs VulnSrc) Get(release string, pkgName string) ([]types.Advisory, error) {

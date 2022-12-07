@@ -33,14 +33,36 @@ var (
 	}
 )
 
+type Option func(src *VulnSrc)
+
+func WithCustomPut(put db.CustomPut) Option {
+	return func(src *VulnSrc) {
+		src.put = put
+	}
+}
+
+func WithDB(db db.Operation) Option {
+	return func(src *VulnSrc) {
+		src.dbc = db
+	}
+}
+
 type VulnSrc struct {
+	put db.CustomPut
 	dbc db.Operation
 }
 
-func NewVulnSrc() VulnSrc {
-	return VulnSrc{
+func NewVulnSrc(opts ...Option) VulnSrc {
+	src := VulnSrc{
+		put: defaultPut,
 		dbc: db.Config{},
 	}
+
+	for _, o := range opts {
+		o(&src)
+	}
+
+	return src
 }
 
 func (vs VulnSrc) Name() types.SourceID {
@@ -98,14 +120,9 @@ func (vs VulnSrc) Update(dir string) error {
 
 func (vs VulnSrc) save(errataVer map[string][]RLSA) error {
 	err := vs.dbc.BatchUpdate(func(tx *bolt.Tx) error {
-		for majorVer, errata := range errataVer {
-			platformName := fmt.Sprintf(platformFormat, majorVer)
-			if err := vs.dbc.PutDataSource(tx, platformName, source); err != nil {
-				return xerrors.Errorf("failed to put data source: %w", err)
-			}
-			if err := vs.commit(tx, platformName, errata); err != nil {
-				return xerrors.Errorf("error in save Rocky %s: %w", majorVer, err)
-			}
+		err := vs.commit(tx, errataVer)
+		if err != nil {
+			return err
 		}
 		return nil
 	})
@@ -115,45 +132,63 @@ func (vs VulnSrc) save(errataVer map[string][]RLSA) error {
 	return nil
 }
 
-func (vs VulnSrc) commit(tx *bolt.Tx, platformName string, errata []RLSA) error {
-	for _, erratum := range errata {
-		for _, cveID := range erratum.CveIDs {
-			putAdvisoryCount := 0
-			for _, pkg := range erratum.Packages {
-				// Skip the modular packages until the following bug is fixed.
-				// https://forums.rockylinux.org/t/some-errata-missing-in-comparison-with-rhel-and-almalinux/3843/8
-				if strings.Contains(pkg.Release, ".module+el") {
-					continue
+func (vs VulnSrc) commit(tx *bolt.Tx, errataVer map[string][]RLSA) error {
+	if err := vs.put(vs.dbc, tx, errataVer); err != nil {
+		return xerrors.Errorf("put error: %w", err)
+	}
+	return nil
+}
+
+func defaultPut(dbi interface{}, tx *bolt.Tx, advisory interface{}) error {
+	dbc := dbi.(db.Config)
+	errataVer, ok := advisory.(map[string][]RLSA)
+	if !ok {
+		return xerrors.New("unknown type")
+	}
+	for majorVer, errata := range errataVer {
+		platformName := fmt.Sprintf(platformFormat, majorVer)
+		if err := dbc.PutDataSource(tx, platformName, source); err != nil {
+			return xerrors.Errorf("failed to put data source: %w", err)
+		}
+		for _, erratum := range errata {
+			for _, cveID := range erratum.CveIDs {
+				putAdvisoryCount := 0
+				for _, pkg := range erratum.Packages {
+					// Skip the modular packages until the following bug is fixed.
+					// https://forums.rockylinux.org/t/some-errata-missing-in-comparison-with-rhel-and-almalinux/3843/8
+					if strings.Contains(pkg.Release, ".module+el") {
+						continue
+					}
+
+					advisory := types.Advisory{
+						FixedVersion: utils.ConstructVersion(pkg.Epoch, pkg.Version, pkg.Release),
+					}
+					if err := dbc.PutAdvisoryDetail(tx, cveID, pkg.Name, []string{platformName}, advisory); err != nil {
+						return xerrors.Errorf("failed to save Rocky advisory: %w", err)
+					}
+
+					putAdvisoryCount++
 				}
 
-				advisory := types.Advisory{
-					FixedVersion: utils.ConstructVersion(pkg.Epoch, pkg.Version, pkg.Release),
-				}
-				if err := vs.dbc.PutAdvisoryDetail(tx, cveID, pkg.Name, []string{platformName}, advisory); err != nil {
-					return xerrors.Errorf("failed to save Rocky advisory: %w", err)
-				}
+				if putAdvisoryCount > 0 {
+					var references []string
+					for _, ref := range erratum.References {
+						references = append(references, ref.Href)
+					}
 
-				putAdvisoryCount++
-			}
+					vuln := types.VulnerabilityDetail{
+						Severity:    generalizeSeverity(erratum.Severity),
+						References:  references,
+						Title:       erratum.Title,
+						Description: erratum.Description,
+					}
+					if err := dbc.PutVulnerabilityDetail(tx, cveID, source.ID, vuln); err != nil {
+						return xerrors.Errorf("failed to save Rocky vulnerability: %w", err)
+					}
 
-			if putAdvisoryCount > 0 {
-				var references []string
-				for _, ref := range erratum.References {
-					references = append(references, ref.Href)
-				}
-
-				vuln := types.VulnerabilityDetail{
-					Severity:    generalizeSeverity(erratum.Severity),
-					References:  references,
-					Title:       erratum.Title,
-					Description: erratum.Description,
-				}
-				if err := vs.dbc.PutVulnerabilityDetail(tx, cveID, source.ID, vuln); err != nil {
-					return xerrors.Errorf("failed to save Rocky vulnerability: %w", err)
-				}
-
-				if err := vs.dbc.PutVulnerabilityID(tx, cveID); err != nil {
-					return xerrors.Errorf("failed to save the vulnerability ID: %w", err)
+					if err := dbc.PutVulnerabilityID(tx, cveID); err != nil {
+						return xerrors.Errorf("failed to save the vulnerability ID: %w", err)
+					}
 				}
 			}
 		}
